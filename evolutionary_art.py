@@ -10,26 +10,24 @@ from skimage.metrics import structural_similarity as ssim
 class BrushStrokeEA:
     def __init__(self, target_path: str, brush_path: str, output_prefix: str):
         """
-        Evolutionary Algorithm for image generation using brush strokes with layered approach
+        Multi-Resolution Evolutionary Algorithm with Greedy Refinement
         
         Args:
             target_path: Path to target image
             brush_path: Path to brush stroke PNG
             output_prefix: Prefix for output files (NameSurname)
         """
-        # Load target image
-        self.target = cv2.imread(target_path)
-        self.target = cv2.resize(self.target, (512, 512))
-        self.target_gray = cv2.cvtColor(self.target, cv2.COLOR_BGR2GRAY)
-        self.target_edges = cv2.Canny(self.target_gray, 50, 150)
+        # Load original target image
+        self.target_original = cv2.imread(target_path)
+        self.target_original = cv2.resize(self.target_original, (512, 512))
         
-        # Compute gradient direction for brush orientation
-        sobelx = cv2.Sobel(self.target_gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(self.target_gray, cv2.CV_64F, 0, 1, ksize=3)
-        self.gradient_direction = np.arctan2(sobely, sobelx) * 180 / np.pi
-        
-        # Precompute target histograms for each channel
-        self.target_hist = [cv2.calcHist([self.target], [i], None, [256], [0, 256]) for i in range(3)]
+        # Current resolution targets (will be set per phase)
+        self.target = None
+        self.target_gray = None
+        self.target_edges = None
+        self.target_hist = None
+        self.gradient_direction = None
+        self.current_resolution = None
         
         # Load and preprocess brush stroke
         self.brush_original = Image.open(brush_path).convert('RGBA')
@@ -40,34 +38,50 @@ class BrushStrokeEA:
         self.image_index = os.path.basename(target_path).replace('input', '').replace('.jpg', '')
         
         # EA parameters
-        self.population_size = 30
+        self.population_size = 25
         self.elitism_count = 5
         self.crossover_rate = 0.8
         self.mutation_rate = 0.3
         
-        # Fitness weights (added SSIM)
+        # Fitness weights
         self.w_mse = 0.25
-        self.w_hist = 0.25
-        self.w_edge = 0.25
-        self.w_ssim = 0.25
+        self.w_hist = 0.4
+        self.w_edge = 0.15
+        self.w_ssim = 0.2
         
-        # Layered approach with reduced small strokes and adjusted alpha
-        self.layers = [
-            (10, (150, 300), 60, "background", (180, 255)),      # Layer 1: Background (opaque)
-            (30, (60, 90), 80, "base", (150, 230)),             # Layer 2: Base shapes
-            (100, (30, 50), 100, "medium", (130, 200)),         # Layer 3: Medium details
-            (200, (15, 25), 120, "details", (100, 170)),        # Layer 4: Fine details (reduced from 250)
-            (150, (8, 15), 100, "refinement", (80, 140))        # Layer 5: Refinement (reduced from 400)
+        # Multi-resolution phases: (resolution, layers_config, greedy_iterations)
+        # Each layer: (num_strokes, size_range, generations, layer_type, alpha_range)
+        self.phases = [
+            # Phase 0: 64x64 - Form and Color
+            (64, [
+                (5, (20, 30), 40, "background", (200, 255)),
+            ], 30),
+            # Phase 1: 128x128 - Form and Color
+            (128, [
+                (5, (20, 30), 40, "background", (200, 255)),
+                (15, (12, 20), 50, "base", (160, 220)),
+                (40, (6, 12), 60, "structure", (130, 190))
+            ], 30),
+            
+            # Phase 2: 256x256 - Structure
+            (256, [
+                (60, (10, 18), 70, "medium", (120, 180)),
+                (100, (5, 10), 80, "details", (100, 160))
+            ], 40),
+            
+            # Phase 3: 512x512 - Details
+            (512, [
+                (150, (8, 15), 90, "fine_details", (90, 150)),
+                (100, (5, 10), 80, "refinement", (70, 130))
+            ], 50)
         ]
         
         self.accumulated_strokes = []
-        
-        # Early stopping parameters
-        self.patience = 15  # Stop if no improvement for 15 generations
+        self.patience = 15
         
     def _preload_brushes(self):
-        """Preload brush strokes of different sizes for speed"""
-        sizes = [8, 10, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 120, 150]
+        """Preload brush strokes of different sizes"""
+        sizes = [5, 6, 8, 10, 12, 15, 18, 20, 25, 30, 35, 40, 50, 60, 70, 80]
         for size in sizes:
             aspect_ratio = self.brush_original.width / self.brush_original.height
             new_width = int(size * aspect_ratio)
@@ -75,106 +89,118 @@ class BrushStrokeEA:
             self.brush_cache[size] = brush_resized
     
     def _get_brush(self, size: int) -> Image.Image:
-        """Get cached or create brush of specified size"""
+        """Get cached brush"""
         if size in self.brush_cache:
             return self.brush_cache[size]
-        
         closest = min(self.brush_cache.keys(), key=lambda x: abs(x - size))
         return self.brush_cache[closest]
     
+    def set_resolution(self, resolution: int):
+        """Set current working resolution and precompute target features"""
+        self.current_resolution = resolution
+        self.target = cv2.resize(self.target_original, (resolution, resolution))
+        self.target_gray = cv2.cvtColor(self.target, cv2.COLOR_BGR2GRAY)
+        self.target_edges = cv2.Canny(self.target_gray, 50, 150)
+        
+        # Compute gradient direction
+        sobelx = cv2.Sobel(self.target_gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(self.target_gray, cv2.CV_64F, 0, 1, ksize=3)
+        self.gradient_direction = np.arctan2(sobely, sobelx) * 180 / np.pi
+        
+        # Precompute histograms
+        self.target_hist = [cv2.calcHist([self.target], [i], None, [256], [0, 256]) for i in range(3)]
+    
+    def upscale_strokes(self, scale_factor: float):
+        """Upscale all accumulated strokes by scale factor"""
+        for i in range(len(self.accumulated_strokes)):
+            layer = self.accumulated_strokes[i].copy()
+            layer[:, 0] *= scale_factor  # x
+            layer[:, 1] *= scale_factor  # y
+            layer[:, 5] *= scale_factor  # size
+            # Keep color, rotation, alpha the same
+            self.accumulated_strokes[i] = layer
+    
     def sample_color_from_region(self, x: int, y: int, radius: int = 10) -> Tuple[int, int, int]:
-        """Sample average color from region around point"""
-        x1 = max(0, x - radius)
-        y1 = max(0, y - radius)
-        x2 = min(512, x + radius)
-        y2 = min(512, y + radius)
+        """Sample average color from region"""
+        res = self.current_resolution
+        x1 = max(0, int(x - radius))
+        y1 = max(0, int(y - radius))
+        x2 = min(res, int(x + radius))
+        y2 = min(res, int(y + radius))
         
         region = self.target[y1:y2, x1:x2]
+        if region.size == 0:
+            return (128, 128, 128)
         avg_color = np.mean(region, axis=(0, 1))
         return tuple(map(int, avg_color[::-1]))  # BGR to RGB
     
     def get_gradient_angle(self, x: int, y: int) -> float:
-        """Get gradient direction at point for brush orientation"""
-        x = np.clip(x, 0, 511)
-        y = np.clip(y, 0, 511)
-        return self.gradient_direction[int(y), int(x)]
+        """Get gradient direction at point"""
+        res = self.current_resolution
+        x = np.clip(int(x), 0, res - 1)
+        y = np.clip(int(y), 0, res - 1)
+        return self.gradient_direction[y, x]
     
     def create_smart_individual(self, num_strokes: int, size_range: Tuple[int, int], 
                                layer_type: str, alpha_range: Tuple[int, int]) -> np.ndarray:
-        """
-        Create individual with smart initialization based on target image
-        Each stroke: [x, y, r, g, b, size, rotation, alpha]
-        """
+        """Create individual with smart initialization"""
         individual = np.zeros((num_strokes, 8))
+        res = self.current_resolution
         
         if layer_type == "background":
-            # Background: cover entire canvas with large strokes
             grid_size = int(np.sqrt(num_strokes)) + 1
-            spacing = 512 // grid_size
+            spacing = res // grid_size
             idx = 0
             
             for i in range(grid_size):
                 for j in range(grid_size):
                     if idx >= num_strokes:
                         break
-                    x = min(i * spacing + spacing // 2, 511)
-                    y = min(j * spacing + spacing // 2, 511)
+                    x = min(i * spacing + spacing // 2, res - 1)
+                    y = min(j * spacing + spacing // 2, res - 1)
                     
-                    individual[idx, 0] = x + np.random.randint(-spacing//3, spacing//3)
-                    individual[idx, 1] = y + np.random.randint(-spacing//3, spacing//3)
+                    individual[idx, 0] = x + np.random.randint(-spacing//3, spacing//3 + 1)
+                    individual[idx, 1] = y + np.random.randint(-spacing//3, spacing//3 + 1)
                     
-                    # Sample color from target
-                    r, g, b = self.sample_color_from_region(int(individual[idx, 0]), 
-                                                           int(individual[idx, 1]), radius=30)
+                    r, g, b = self.sample_color_from_region(individual[idx, 0], individual[idx, 1], radius=15)
                     individual[idx, 2:5] = [r, g, b]
                     individual[idx, 5] = np.random.randint(size_range[0], size_range[1])
                     
-                    # Use gradient direction for rotation
                     angle = self.get_gradient_angle(individual[idx, 0], individual[idx, 1])
                     individual[idx, 6] = (angle + np.random.randint(-20, 20)) % 360
-                    
                     individual[idx, 7] = np.random.randint(alpha_range[0], alpha_range[1])
                     idx += 1
                     
-        elif layer_type in ["base", "medium"]:
-            # Base/Medium: focus on edges and color regions
+        elif layer_type in ["base", "structure", "medium"]:
             for i in range(num_strokes):
-                # Mix of edge-based and random placement
-                if random.random() < 0.6:  # 60% on edges
+                if random.random() < 0.6:
                     edge_points = np.argwhere(self.target_edges > 100)
                     if len(edge_points) > 0:
                         point = edge_points[np.random.randint(len(edge_points))]
-                        individual[i, 1], individual[i, 0] = point  # y, x
+                        individual[i, 1], individual[i, 0] = point
                     else:
-                        individual[i, 0] = np.random.randint(0, 512)
-                        individual[i, 1] = np.random.randint(0, 512)
-                else:  # 40% random
-                    individual[i, 0] = np.random.randint(0, 512)
-                    individual[i, 1] = np.random.randint(0, 512)
+                        individual[i, 0] = np.random.randint(0, res)
+                        individual[i, 1] = np.random.randint(0, res)
+                else:
+                    individual[i, 0] = np.random.randint(0, res)
+                    individual[i, 1] = np.random.randint(0, res)
                 
-                # Sample color from target
-                r, g, b = self.sample_color_from_region(int(individual[i, 0]), 
-                                                       int(individual[i, 1]), radius=15)
+                r, g, b = self.sample_color_from_region(individual[i, 0], individual[i, 1], radius=8)
                 individual[i, 2:5] = [r, g, b]
                 individual[i, 5] = np.random.randint(size_range[0], size_range[1])
                 
-                # Use gradient direction for rotation
                 angle = self.get_gradient_angle(individual[i, 0], individual[i, 1])
                 individual[i, 6] = (angle + np.random.randint(-30, 30)) % 360
-                
                 individual[i, 7] = np.random.randint(alpha_range[0], alpha_range[1])
                 
-        else:  # details, refinement
-            # Detail layers: more random but still color-aware
-            individual[:, 0] = np.random.randint(0, 512, num_strokes)
-            individual[:, 1] = np.random.randint(0, 512, num_strokes)
+        else:  # details, fine_details, refinement
+            individual[:, 0] = np.random.randint(0, res, num_strokes)
+            individual[:, 1] = np.random.randint(0, res, num_strokes)
             
             for i in range(num_strokes):
-                r, g, b = self.sample_color_from_region(int(individual[i, 0]), 
-                                                       int(individual[i, 1]), radius=8)
+                r, g, b = self.sample_color_from_region(individual[i, 0], individual[i, 1], radius=5)
                 individual[i, 2:5] = [r, g, b]
                 
-                # Use gradient direction for rotation
                 angle = self.get_gradient_angle(individual[i, 0], individual[i, 1])
                 individual[i, 6] = (angle + np.random.randint(-45, 45)) % 360
             
@@ -184,13 +210,17 @@ class BrushStrokeEA:
         return individual
     
     def render_strokes(self, strokes_list: List[np.ndarray]) -> np.ndarray:
-        """Render multiple layers of strokes"""
-        canvas = Image.new('RGB', (512, 512), (255, 255, 255))
+        """Render strokes at current resolution"""
+        res = self.current_resolution
+        canvas = Image.new('RGB', (res, res), (255, 255, 255))
         
-        # Render all layers in order
         for strokes in strokes_list:
             for stroke in strokes:
                 x, y, r, g, b, size, rotation, alpha = stroke
+                
+                # Clip coordinates to current resolution
+                if x < 0 or x >= res or y < 0 or y >= res:
+                    continue
                 
                 brush = self._get_brush(int(size))
                 brush = brush.rotate(rotation, expand=True, resample=Image.BILINEAR)
@@ -209,34 +239,29 @@ class BrushStrokeEA:
         return cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
     
     def fitness(self, current_layer: np.ndarray) -> float:
-        """
-        Calculate fitness using MSE, histogram, edge similarity, and SSIM
-        Lower is better
-        """
-        # Render all accumulated layers + current layer
+        """Calculate fitness with MSE, histogram, edge, and SSIM"""
         all_strokes = self.accumulated_strokes + [current_layer]
         rendered = self.render_strokes(all_strokes)
         
         # MSE
         mse = np.mean((self.target.astype(float) - rendered.astype(float)) ** 2)
         
-        # Histogram comparison
+        # Histogram
         hist_diff = 0
         for i in range(3):
             hist = cv2.calcHist([rendered], [i], None, [256], [0, 256])
             hist_diff += cv2.compareHist(self.target_hist[i], hist, cv2.HISTCMP_CHISQR)
         hist_diff /= 3
         
-        # Edge similarity
+        # Edge
         rendered_gray = cv2.cvtColor(rendered, cv2.COLOR_BGR2GRAY)
         rendered_edges = cv2.Canny(rendered_gray, 50, 150)
         edge_diff = np.mean((self.target_edges.astype(float) - rendered_edges.astype(float)) ** 2)
         
-        # SSIM (Structural Similarity) - convert to dissimilarity (1 - ssim)
+        # SSIM
         ssim_score = ssim(self.target_gray, rendered_gray, data_range=255)
-        ssim_dissimilarity = (1 - ssim_score) * 10000  # Scale to similar range as MSE
+        ssim_dissimilarity = (1 - ssim_score) * 10000
         
-        # Weighted fitness
         fitness_value = (self.w_mse * mse + 
                         self.w_hist * hist_diff + 
                         self.w_edge * edge_diff + 
@@ -257,36 +282,34 @@ class BrushStrokeEA:
     
     def mutate(self, individual: np.ndarray, size_range: Tuple[int, int], 
                alpha_range: Tuple[int, int], mutation_rate: float) -> np.ndarray:
-        """Mutate individual parameters with color sampling and gradient-based rotation"""
+        """Mutate individual"""
         mutated = individual.copy()
+        res = self.current_resolution
         
         for i in range(len(mutated)):
             if random.random() < mutation_rate:
                 gene = random.randint(0, 7)
                 
                 if gene == 0:  # x
-                    mutated[i, 0] = np.clip(mutated[i, 0] + np.random.randint(-30, 30), 0, 511)
+                    mutated[i, 0] = np.clip(mutated[i, 0] + np.random.randint(-20, 20), 0, res - 1)
                 elif gene == 1:  # y
-                    mutated[i, 1] = np.clip(mutated[i, 1] + np.random.randint(-30, 30), 0, 511)
-                elif gene in [2, 3, 4]:  # r, g, b - resample from target
+                    mutated[i, 1] = np.clip(mutated[i, 1] + np.random.randint(-20, 20), 0, res - 1)
+                elif gene in [2, 3, 4]:  # color
                     if random.random() < 0.5:
-                        r, g, b = self.sample_color_from_region(int(mutated[i, 0]), 
-                                                               int(mutated[i, 1]), radius=10)
+                        r, g, b = self.sample_color_from_region(mutated[i, 0], mutated[i, 1], radius=8)
                         mutated[i, 2:5] = [r, g, b]
                     else:
                         mutated[i, gene] = np.clip(mutated[i, gene] + np.random.randint(-20, 20), 0, 255)
                 elif gene == 5:  # size
-                    mutated[i, 5] = np.clip(mutated[i, 5] + np.random.randint(-5, 5), 
-                                           size_range[0], size_range[1])
-                elif gene == 6:  # rotation - use gradient with perturbation
+                    mutated[i, 5] = np.clip(mutated[i, 5] + np.random.randint(-3, 3), size_range[0], size_range[1])
+                elif gene == 6:  # rotation
                     if random.random() < 0.3:
                         angle = self.get_gradient_angle(mutated[i, 0], mutated[i, 1])
                         mutated[i, 6] = (angle + np.random.randint(-30, 30)) % 360
                     else:
                         mutated[i, 6] = (mutated[i, 6] + np.random.randint(-45, 45)) % 360
                 elif gene == 7:  # alpha
-                    mutated[i, 7] = np.clip(mutated[i, 7] + np.random.randint(-20, 20), 
-                                           alpha_range[0], alpha_range[1])
+                    mutated[i, 7] = np.clip(mutated[i, 7] + np.random.randint(-20, 20), alpha_range[0], alpha_range[1])
         
         return mutated
     
@@ -294,20 +317,17 @@ class BrushStrokeEA:
                      generations: int, layer_type: str, alpha_range: Tuple[int, int]) -> Tuple:
         """Evolve one layer with early stopping"""
         print(f"\n=== Layer {layer_num} ({layer_type}): {num_strokes} strokes, "
-              f"size {size_range}, max {generations} generations ===")
+              f"size {size_range}, max {generations} generations, res {self.current_resolution} ===")
         
-        # Initialize population with smart placement
         population = [self.create_smart_individual(num_strokes, size_range, layer_type, alpha_range) 
                      for _ in range(self.population_size)]
         
         avg_fitness_history = []
         max_fitness_history = []
-        
         best_fitness = float('inf')
         patience_counter = 0
         
         for gen in range(generations):
-            # Evaluate fitness
             fitness_scores = [self.fitness(ind) for ind in population]
             
             avg_fitness = np.mean(fitness_scores)
@@ -315,37 +335,30 @@ class BrushStrokeEA:
             avg_fitness_history.append(avg_fitness)
             max_fitness_history.append(min_fitness)
             
-            # Early stopping check
-            if min_fitness < best_fitness - 1.0:  # Improvement threshold
+            if min_fitness < best_fitness - 1.0:
                 best_fitness = min_fitness
                 patience_counter = 0
             else:
                 patience_counter += 1
             
             if gen % 10 == 0:
-                print(f"Gen {gen}/{generations}: Avg={avg_fitness:.2f}, Best={min_fitness:.2f}, "
-                      f"Patience={patience_counter}/{self.patience}")
+                print(f"Gen {gen}: Avg={avg_fitness:.2f}, Best={min_fitness:.2f}, Patience={patience_counter}/{self.patience}")
             
-            # Early stopping
             if patience_counter >= self.patience:
-                print(f"Early stopping at generation {gen} (no improvement for {self.patience} gens)")
+                print(f"Early stopping at gen {gen}")
                 break
             
-            # Selection
             sorted_indices = np.argsort(fitness_scores)
             sorted_population = [population[i] for i in sorted_indices]
             
-            # Elitism
             new_population = sorted_population[:self.elitism_count]
             
-            # Generate offspring
             while len(new_population) < self.population_size:
                 parent1 = sorted_population[random.randint(0, self.population_size // 2)]
                 parent2 = sorted_population[random.randint(0, self.population_size // 2)]
                 
                 child1, child2 = self.crossover(parent1, parent2)
                 
-                # Adaptive mutation
                 adaptive_rate = self.mutation_rate * (1 - 0.5 * gen / generations)
                 child1 = self.mutate(child1, size_range, alpha_range, adaptive_rate)
                 child2 = self.mutate(child2, size_range, alpha_range, adaptive_rate)
@@ -354,7 +367,6 @@ class BrushStrokeEA:
             
             population = new_population[:self.population_size]
         
-        # Return best individual
         fitness_scores = [self.fitness(ind) for ind in population]
         best_idx = np.argmin(fitness_scores)
         
@@ -362,11 +374,68 @@ class BrushStrokeEA:
         
         return population[best_idx], avg_fitness_history, max_fitness_history
     
+    def greedy_refinement(self, iterations: int, region_size: int):
+        """Greedy refinement: add strokes to worst error regions"""
+        print(f"\n=== Greedy Refinement: {iterations} iterations, region {region_size}x{region_size} ===")
+        
+        res = self.current_resolution
+        
+        for iteration in range(iterations):
+            # Render current state
+            rendered = self.render_strokes(self.accumulated_strokes)
+            
+            # Compute error map
+            error_map = np.mean(np.abs(self.target.astype(float) - rendered.astype(float)), axis=2)
+            
+            # Find worst regions
+            num_regions = 5
+            worst_regions = []
+            
+            for _ in range(num_regions):
+                # Apply max pooling to find worst region
+                max_val = 0
+                max_pos = (0, 0)
+                
+                for y in range(0, res - region_size, region_size // 2):
+                    for x in range(0, res - region_size, region_size // 2):
+                        region_error = np.mean(error_map[y:y+region_size, x:x+region_size])
+                        if region_error > max_val:
+                            max_val = region_error
+                            max_pos = (x, y)
+                
+                worst_regions.append(max_pos)
+                # Zero out this region to find next worst
+                error_map[max_pos[1]:max_pos[1]+region_size, max_pos[0]:max_pos[0]+region_size] = 0
+            
+            # Add strokes to worst regions
+            new_strokes = []
+            for x, y in worst_regions:
+                # Add 2-3 strokes per region
+                for _ in range(random.randint(2, 3)):
+                    stroke_x = x + region_size // 2 + np.random.randint(-region_size//4, region_size//4)
+                    stroke_y = y + region_size // 2 + np.random.randint(-region_size//4, region_size//4)
+                    stroke_x = np.clip(stroke_x, 0, res - 1)
+                    stroke_y = np.clip(stroke_y, 0, res - 1)
+                    
+                    r, g, b = self.sample_color_from_region(stroke_x, stroke_y, radius=5)
+                    size = region_size // 3
+                    angle = self.get_gradient_angle(stroke_x, stroke_y)
+                    alpha = np.random.randint(100, 180)
+                    
+                    new_strokes.append([stroke_x, stroke_y, r, g, b, size, angle, alpha])
+            
+            if new_strokes:
+                self.accumulated_strokes.append(np.array(new_strokes))
+            
+            if iteration % 10 == 0:
+                current_fitness = self.fitness(np.zeros((1, 8)))  # Dummy, just to get fitness
+                print(f"Greedy iter {iteration}/{iterations}: Fitness={current_fitness:.2f}")
+    
     def run(self, run_number: int):
-        """Run complete evolutionary algorithm with layered approach"""
-        print(f"\n{'='*70}")
-        print(f"Starting EA Run {run_number} - Layered Approach with Improvements")
-        print(f"{'='*70}")
+        """Run multi-resolution EA with greedy refinement"""
+        print(f"\n{'='*80}")
+        print(f"Starting Multi-Resolution EA with Greedy Refinement - Run {run_number}")
+        print(f"{'='*80}")
         
         start_time = time.time()
         self.accumulated_strokes = []
@@ -374,41 +443,65 @@ class BrushStrokeEA:
         all_avg_histories = []
         all_max_histories = []
         
-        # Evolve each layer sequentially
-        for layer_num, (num_strokes, size_range, generations, layer_type, alpha_range) in enumerate(self.layers, 1):
-            best_layer, avg_hist, max_hist = self.evolve_layer(
-                layer_num, num_strokes, size_range, generations, layer_type, alpha_range
-            )
+        # Multi-resolution phases
+        for phase_num, (resolution, layers_config, greedy_iters) in enumerate(self.phases, 1):
+            print(f"\n{'='*80}")
+            print(f"PHASE {phase_num}: Resolution {resolution}x{resolution}")
+            print(f"{'='*80}")
             
-            # Add this layer to accumulated strokes
-            self.accumulated_strokes.append(best_layer)
-            all_avg_histories.append(avg_hist)
-            all_max_histories.append(max_hist)
+            # Upscale strokes from previous phase
+            if phase_num > 1:
+                prev_resolution = self.phases[phase_num - 2][0]
+                scale_factor = resolution / prev_resolution
+                print(f"Upscaling strokes by {scale_factor}x")
+                self.upscale_strokes(scale_factor)
             
-            # Show intermediate result
+            # Set current resolution
+            self.set_resolution(resolution)
+            
+            # Evolve layers at this resolution
+            for layer_num, (num_strokes, size_range, generations, layer_type, alpha_range) in enumerate(layers_config, 1):
+                global_layer_num = sum(len(p[1]) for p in self.phases[:phase_num-1]) + layer_num
+                
+                best_layer, avg_hist, max_hist = self.evolve_layer(
+                    global_layer_num, num_strokes, size_range, generations, layer_type, alpha_range
+                )
+                
+                self.accumulated_strokes.append(best_layer)
+                all_avg_histories.append(avg_hist)
+                all_max_histories.append(max_hist)
+            
+            # Greedy refinement at this resolution
+            region_size = max(8, resolution // 16)
+            self.greedy_refinement(greedy_iters, region_size)
+            
+            # Save intermediate result
             intermediate = self.render_strokes(self.accumulated_strokes)
-            cv2.imwrite(f"temp_layer{layer_num}_run{run_number}.jpg", intermediate)
+            intermediate_resized = cv2.resize(intermediate, (512, 512))
+            cv2.imwrite(f"temp_phase{phase_num}_run{run_number}.jpg", intermediate_resized)
         
         elapsed_time = time.time() - start_time
-        print(f"\nTotal time: {elapsed_time/60:.2f} minutes")
+        print(f"\n{'='*80}")
+        print(f"Total time: {elapsed_time/60:.2f} minutes")
+        print(f"{'='*80}")
         
-        # Generate final variations by slightly mutating the best result
+        # Generate final variations
         final_results = []
         
-        # Best result (no mutation)
+        # Best result
         final_results.append(self.render_strokes(self.accumulated_strokes))
         
-        # 4 variations with slight mutations
+        # 4 slight variations
         for i in range(4):
             mutated_strokes = []
-            for layer_idx, layer in enumerate(self.accumulated_strokes):
+            for layer in self.accumulated_strokes:
                 size_range = (int(np.min(layer[:, 5])), int(np.max(layer[:, 5])))
                 alpha_range = (int(np.min(layer[:, 7])), int(np.max(layer[:, 7])))
-                mutated = self.mutate(layer.copy(), size_range, alpha_range, 0.05)
+                mutated = self.mutate(layer.copy(), size_range, alpha_range, 0.03)
                 mutated_strokes.append(mutated)
             final_results.append(self.render_strokes(mutated_strokes))
         
-        # Save top 5 results
+        # Save results
         for i, result in enumerate(final_results, 1):
             output_path = f"{self.output_prefix}Output{self.image_index}_{run_number}_{i}.jpg"
             cv2.imwrite(output_path, result)
@@ -419,15 +512,15 @@ class BrushStrokeEA:
 
 # Main execution
 if __name__ == "__main__":
-    INPUT_IMAGE = "input5.jpg"
+    INPUT_IMAGE = "input1.jpg"
     BRUSH_STROKE = "brush.png"
-    OUTPUT_PREFIX = "E"
-    NUM_RUNS = 1
+    OUTPUT_PREFIX = "NameSurname"
+    NUM_RUNS = 3
     
     for run in range(1, NUM_RUNS + 1):
         ea = BrushStrokeEA(INPUT_IMAGE, BRUSH_STROKE, OUTPUT_PREFIX)
         elapsed, avg_histories, max_histories = ea.run(run)
         
-        print(f"\n{'='*70}")
+        print(f"\n{'='*80}")
         print(f"Run {run} completed in {elapsed/60:.2f} minutes")
-        print(f"{'='*70}\n")
+        print(f"{'='*80}\n")
