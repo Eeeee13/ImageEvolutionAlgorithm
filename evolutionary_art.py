@@ -28,11 +28,15 @@ class BrushStrokeEA:
         self.target_hist = None
         self.gradient_direction = None
         self.current_resolution = None
+
+        self.run_folder = None
         
         # Load and preprocess brush stroke
         self.brush_original = Image.open(brush_path).convert('RGBA')
         self.brush_cache = {}
         self._preload_brushes()
+        self.canvas_cache = None  # PIL Image
+        self.canvas_cache_cv = None  # CV2 array для fitness
         
         self.output_prefix = output_prefix
         self.image_index = os.path.basename(target_path).replace('input', '').replace('.jpg', '')
@@ -54,25 +58,30 @@ class BrushStrokeEA:
         self.phases = [
             # Phase 0: 64x64 - Form and Color
             (64, [
-                (5, (20, 30), 40, "background", (200, 255)),
-            ], 30),
+                (50, (20, 30), 40, "background", (200, 255)),
+            ], 10),
             # Phase 1: 128x128 - Form and Color
             (128, [
-                (5, (20, 30), 40, "background", (200, 255)),
+                (12, (20, 30), 40, "background", (200, 255)),
                 (15, (12, 20), 50, "base", (160, 220)),
-                (40, (6, 12), 60, "structure", (130, 190))
+                (60, (6, 12), 60, "structure", (130, 190))
             ], 30),
             
             # Phase 2: 256x256 - Structure
             (256, [
-                (60, (10, 18), 70, "medium", (120, 180)),
+                (100, (10, 18), 70, "medium", (120, 180)),
                 (100, (5, 10), 80, "details", (100, 160))
             ], 40),
             
             # Phase 3: 512x512 - Details
             (512, [
-                (150, (8, 15), 90, "fine_details", (90, 150)),
-                (100, (5, 10), 80, "refinement", (70, 130))
+                (150, (10, 15), 90, "fine_details", (90, 150)),
+                (200, (8, 10), 90, "fine_details 2 ", (80, 140)),
+                (200, (3, 5), 90, "refinement", (70, 130)),
+                (200, (1, 3), 90, "refinement 2 ", (50, 130)),
+                (200, (1, 3), 90, "refinement 3 ", (50, 130)),
+                (200, (0.5, 1), 80, "refinement 4 ", (50, 120))
+                
             ], 50)
         ]
         
@@ -112,6 +121,8 @@ class BrushStrokeEA:
     
     def upscale_strokes(self, scale_factor: float):
         """Upscale all accumulated strokes by scale factor"""
+        self.canvas_cache = None
+        self.canvas_cache_cv = None
         for i in range(len(self.accumulated_strokes)):
             layer = self.accumulated_strokes[i].copy()
             layer[:, 0] *= scale_factor  # x
@@ -209,18 +220,24 @@ class BrushStrokeEA:
         
         return individual
     
-    def render_strokes(self, strokes_list: List[np.ndarray]) -> np.ndarray:
+    def render_strokes(self, strokes_list: List[np.ndarray], use_cache: bool = False) -> np.ndarray:
         """Render strokes at current resolution"""
         res = self.current_resolution
-        canvas = Image.new('RGB', (res, res), (255, 255, 255))
         
-        for strokes in strokes_list:
+        if use_cache and self.canvas_cache is not None:
+            canvas = self.canvas_cache.copy()
+            strokes_to_render = [strokes_list[-1]]
+        else:
+            canvas = Image.new('RGB', (res, res), (255, 255, 255))
+            strokes_to_render = strokes_list
+        
+        for strokes in strokes_to_render:
             for stroke in strokes:
                 x, y, r, g, b, size, rotation, alpha = stroke
                 
-                # Clip coordinates to current resolution
-                if x < 0 or x >= res or y < 0 or y >= res:
-                    continue
+                # Clip координаты вместо skip
+                x = np.clip(x, 0, res - 1)
+                y = np.clip(y, 0, res - 1)
                 
                 brush = self._get_brush(int(size))
                 brush = brush.rotate(rotation, expand=True, resample=Image.BILINEAR)
@@ -241,7 +258,7 @@ class BrushStrokeEA:
     def fitness(self, current_layer: np.ndarray) -> float:
         """Calculate fitness with MSE, histogram, edge, and SSIM"""
         all_strokes = self.accumulated_strokes + [current_layer]
-        rendered = self.render_strokes(all_strokes)
+        rendered = self.render_strokes(all_strokes, use_cache=True)
         
         # MSE
         mse = np.mean((self.target.astype(float) - rendered.astype(float)) ** 2)
@@ -257,6 +274,11 @@ class BrushStrokeEA:
         rendered_gray = cv2.cvtColor(rendered, cv2.COLOR_BGR2GRAY)
         rendered_edges = cv2.Canny(rendered_gray, 50, 150)
         edge_diff = np.mean((self.target_edges.astype(float) - rendered_edges.astype(float)) ** 2)
+
+        sobel_t = cv2.Sobel(self.target_gray, cv2.CV_32F, 1, 1)
+        sobel_r = cv2.Sobel(rendered_gray, cv2.CV_32F, 1, 1)
+        edge_diff = np.mean((sobel_t - sobel_r)**2)
+
         
         # SSIM
         ssim_score = ssim(self.target_gray, rendered_gray, data_range=255)
@@ -371,6 +393,15 @@ class BrushStrokeEA:
         best_idx = np.argmin(fitness_scores)
         
         print(f"Layer {layer_num} complete. Best fitness: {fitness_scores[best_idx]:.2f}")
+
+        best_layer = population[best_idx]
+    
+        # Обновить кеш после добавления layer
+        self.accumulated_strokes.append(best_layer)
+        rendered = self.render_strokes(self.accumulated_strokes, use_cache=False)
+        self.canvas_cache = Image.fromarray(cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB))
+        self.canvas_cache_cv = rendered
+        
         
         return population[best_idx], avg_fitness_history, max_fitness_history
     
@@ -430,9 +461,17 @@ class BrushStrokeEA:
             if iteration % 10 == 0:
                 current_fitness = self.fitness(np.zeros((1, 8)))  # Dummy, just to get fitness
                 print(f"Greedy iter {iteration}/{iterations}: Fitness={current_fitness:.2f}")
+
+        rendered = self.render_strokes(self.accumulated_strokes, use_cache=False)
+        self.canvas_cache = Image.fromarray(cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB))
+        self.canvas_cache_cv = rendered
     
     def run(self, run_number: int):
         """Run multi-resolution EA with greedy refinement"""
+
+        self.run_folder = f"run_{run_number}"
+        os.makedirs(self.run_folder, exist_ok=True)
+
         print(f"\n{'='*80}")
         print(f"Starting Multi-Resolution EA with Greedy Refinement - Run {run_number}")
         print(f"{'='*80}")
@@ -458,6 +497,14 @@ class BrushStrokeEA:
             
             # Set current resolution
             self.set_resolution(resolution)
+
+            if len(self.accumulated_strokes) > 0:
+                rendered = self.render_strokes(self.accumulated_strokes, use_cache=False)
+                self.canvas_cache = Image.fromarray(cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB))
+                self.canvas_cache_cv = rendered
+            else:
+                self.canvas_cache = None
+                self.canvas_cache_cv = None
             
             # Evolve layers at this resolution
             for layer_num, (num_strokes, size_range, generations, layer_type, alpha_range) in enumerate(layers_config, 1):
@@ -467,7 +514,7 @@ class BrushStrokeEA:
                     global_layer_num, num_strokes, size_range, generations, layer_type, alpha_range
                 )
                 
-                self.accumulated_strokes.append(best_layer)
+                # self.accumulated_strokes.append(best_layer)
                 all_avg_histories.append(avg_hist)
                 all_max_histories.append(max_hist)
             
@@ -478,7 +525,7 @@ class BrushStrokeEA:
             # Save intermediate result
             intermediate = self.render_strokes(self.accumulated_strokes)
             intermediate_resized = cv2.resize(intermediate, (512, 512))
-            cv2.imwrite(f"temp_phase{phase_num}_run{run_number}.jpg", intermediate_resized)
+            cv2.imwrite(f"{self.run_folder}/temp_phase{phase_num}.jpg", intermediate_resized)
         
         elapsed_time = time.time() - start_time
         print(f"\n{'='*80}")
@@ -503,7 +550,7 @@ class BrushStrokeEA:
         
         # Save results
         for i, result in enumerate(final_results, 1):
-            output_path = f"{self.output_prefix}Output{self.image_index}_{run_number}_{i}.jpg"
+            output_path = f"{self.run_folder}/{self.output_prefix}Output{self.image_index}_{i}.jpg"
             cv2.imwrite(output_path, result)
             print(f"Saved: {output_path}")
         
@@ -512,13 +559,13 @@ class BrushStrokeEA:
 
 # Main execution
 if __name__ == "__main__":
-    INPUT_IMAGE = "input1.jpg"
+    INPUT = "input"
     BRUSH_STROKE = "brush.png"
     OUTPUT_PREFIX = "NameSurname"
-    NUM_RUNS = 3
+    NUM_RUNS = 5
     
     for run in range(1, NUM_RUNS + 1):
-        ea = BrushStrokeEA(INPUT_IMAGE, BRUSH_STROKE, OUTPUT_PREFIX)
+        ea = BrushStrokeEA(f"{INPUT}{run}.jpg", BRUSH_STROKE, OUTPUT_PREFIX)
         elapsed, avg_histories, max_histories = ea.run(run)
         
         print(f"\n{'='*80}")
