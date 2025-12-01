@@ -7,6 +7,8 @@ from typing import List, Tuple
 import os
 from skimage.metrics import structural_similarity as ssim
 
+from Statistics import Statistics
+
 class BrushStrokeEA:
     def __init__(self, target_path: str, brush_path: str, output_prefix: str):
         """
@@ -48,8 +50,8 @@ class BrushStrokeEA:
         self.mutation_rate = 0.3
         
         # Fitness weights
-        self.w_mse = 0.25
-        self.w_hist = 0.4
+        self.w_mse = 0.3
+        self.w_hist = 0.35
         self.w_edge = 0.15
         self.w_ssim = 0.2
         
@@ -416,9 +418,11 @@ class BrushStrokeEA:
         rendered = self.render_strokes(self.accumulated_strokes, use_cache=False)
         self.canvas_cache = Image.fromarray(cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB))
         self.canvas_cache_cv = rendered
+
+        actual_generations = gen + 1
         
         
-        return population[best_idx], avg_fitness_history, max_fitness_history
+        return population[best_idx], avg_fitness_history, max_fitness_history, actual_generations
     
     def greedy_refinement(self, iterations: int, region_size: int):
         """Greedy refinement: add strokes to worst error regions"""
@@ -485,7 +489,7 @@ class BrushStrokeEA:
     def run(self, run_number: int):
         """Run multi-resolution EA with greedy refinement"""
 
-        self.run_folder = f"run_{run}"
+        self.run_folder = f"run_{self.image_index}_{run_number}"
         os.makedirs(self.run_folder, exist_ok=True)
 
         print(f"\n{'='*80}")
@@ -498,6 +502,8 @@ class BrushStrokeEA:
         
         all_avg_histories = []
         all_max_histories = []
+        total_generations = 0
+        layers_info = []  # НОВОЕ: для статистики
         
         # Multi-resolution phases
         for phase_num, (resolution, layers_config, greedy_iters) in enumerate(self.phases, 1):
@@ -505,15 +511,12 @@ class BrushStrokeEA:
             print(f"PHASE {phase_num}: Resolution {resolution}x{resolution}")
             print(f"{'='*80}")
 
-            # Set current resolution
             self.set_resolution(resolution)
             
-            # Upscale strokes from previous phase
             if phase_num > 1:
                 print(f"Upscaling all strokes to {resolution}x{resolution}")
                 self.upscale_strokes(resolution)
             
-
             if len(self.accumulated_strokes) > 0:
                 rendered = self.render_strokes(self.accumulated_strokes, use_cache=False)
                 self.canvas_cache = Image.fromarray(cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB))
@@ -522,42 +525,41 @@ class BrushStrokeEA:
                 self.canvas_cache = None
                 self.canvas_cache_cv = None
             
-            # Evolve layers at this resolution
             for layer_num, (num_strokes, size_range, generations, layer_type, alpha_range) in enumerate(layers_config, 1):
                 global_layer_num = sum(len(p[1]) for p in self.phases[:phase_num-1]) + layer_num
                 
-                best_layer, avg_hist, max_hist = self.evolve_layer(
+                # ИЗМЕНЕНО: распаковываем 4 значения вместо 3
+                best_layer, avg_hist, max_hist, actual_gens = self.evolve_layer(
                     global_layer_num, num_strokes, size_range, generations, layer_type, alpha_range
                 )
                 
-                # self.accumulated_strokes.append(best_layer)
                 all_avg_histories.append(avg_hist)
                 all_max_histories.append(max_hist)
+                total_generations += actual_gens  # НОВОЕ
+                layers_info.append((global_layer_num, num_strokes, actual_gens))  # НОВОЕ
             
-            # Greedy refinement at this resolution
             region_size = max(8, resolution // 16)
             self.greedy_refinement(greedy_iters, region_size)
             
-            # Save intermediate result
             intermediate = self.render_strokes(self.accumulated_strokes)
             intermediate_resized = cv2.resize(intermediate, (512, 512))
             cv2.imwrite(f"{self.run_folder}/temp_phase{phase_num}.jpg", intermediate_resized)
         
         elapsed_time = time.time() - start_time
+        
+        # НОВОЕ: вычислить финальный fitness
+        final_fitness = self.fitness(np.zeros((1, 8)))  # dummy layer для получения общего fitness
+        
         print(f"\n{'='*80}")
         print(f"Total time: {elapsed_time/60:.2f} minutes")
+        print(f"Total generations: {total_generations}")
+        print(f"Final fitness: {final_fitness:.2f}")
         print(f"{'='*80}")
-
-        print(f"\nGenerating final results at resolution {self.current_resolution}")
-        print(f"Total accumulated layers: {len(self.accumulated_strokes)}")
 
         # Generate final variations
         final_results = []
-        
-        # Best result
         final_results.append(self.render_strokes(self.accumulated_strokes, use_cache=False))
         
-        # 4 slight variations
         for i in range(4):
             mutated_strokes = []
             for layer in self.accumulated_strokes:
@@ -567,26 +569,45 @@ class BrushStrokeEA:
                 mutated_strokes.append(mutated)
             final_results.append(self.render_strokes(mutated_strokes))
         
-        # Save results
         for i, result in enumerate(final_results, 1):
             output_path = f"{self.run_folder}/{self.output_prefix}Output{self.image_index}_{i}.jpg"
             cv2.imwrite(output_path, result)
             print(f"Saved: {output_path}")
         
-        return elapsed_time, all_avg_histories, all_max_histories
+        # НОВОЕ: вернуть данные для статистики
+        return elapsed_time, all_avg_histories, all_max_histories, total_generations, final_fitness, layers_info
 
-
-# Main execution
 if __name__ == "__main__":
     INPUT = "input"
     BRUSH_STROKE = "brush.png"
     OUTPUT_PREFIX = "NameSurname"
-    NUM_RUNS = 1
+    NUM_RUNS = 3
     
-    for run in range(1, NUM_RUNS + 1):
-        ea = BrushStrokeEA(f"{INPUT}{run}.jpg", BRUSH_STROKE, OUTPUT_PREFIX)
-        elapsed, avg_histories, max_histories = ea.run(run)
+    # Тестировать на нескольких изображениях
+    test_images = [1, 2, 3, 4, 5] 
+    
+    for img_idx in test_images:
+        print(f"\n{'#'*80}")
+        print(f"# TESTING IMAGE {img_idx}")
+        print(f"{'#'*80}\n")
         
-        print(f"\n{'='*80}")
-        print(f"Run {run} completed in {elapsed/60:.2f} minutes")
-        print(f"{'='*80}\n")
+        stats = Statistics(OUTPUT_PREFIX, str(img_idx))
+        
+        for run in range(1, NUM_RUNS + 1):
+            ea = BrushStrokeEA(f"{INPUT}{img_idx}.jpg", BRUSH_STROKE, OUTPUT_PREFIX)
+            
+            # ИЗМЕНЕНО: распаковываем 6 значений
+            elapsed, avg_histories, max_histories, total_gens, final_fit, layers_info = ea.run(run)
+            
+            # Сохранить статистику
+            stats.add_run(run, elapsed, avg_histories, max_histories, 
+                         total_gens, final_fit, layers_info)
+            
+            print(f"\n{'='*80}")
+            print(f"Run {run} completed in {elapsed/60:.2f} minutes")
+            print(f"{'='*80}\n")
+        
+        # Создать графики и таблицы
+        stats.plot_fitness_curves()
+        stats.generate_summary_table()
+        stats.save_json()
