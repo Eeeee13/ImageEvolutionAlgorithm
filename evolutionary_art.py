@@ -56,40 +56,35 @@ class BrushStrokeEA:
         # Multi-resolution phases: (resolution, layers_config, greedy_iterations)
         # Each layer: (num_strokes, size_range, generations, layer_type, alpha_range)
         self.phases = [
-            # Phase 0: 64x64 - Form and Color
-            (64, [
-                (50, (20, 30), 40, "background", (200, 255)),
-            ], 10),
             # Phase 1: 128x128 - Form and Color
             (128, [
-                (12, (20, 30), 40, "background", (200, 255)),
-                (15, (12, 20), 50, "base", (160, 220)),
+                (12, (10, 18), 80, "background", (200, 255)),
+                (10, (12, 20), 50, "base", (160, 220)),
                 (60, (6, 12), 60, "structure", (130, 190))
-            ], 30),
+            ], 0),
             
             # Phase 2: 256x256 - Structure
             (256, [
-                (100, (10, 18), 70, "medium", (120, 180)),
-                (100, (5, 10), 80, "details", (100, 160))
-            ], 40),
+                (100, (20, 30), 80, "medium", (120, 180)),
+                (100, (15, 20), 80, "details", (100, 160)),
+                (100, (5, 15), 80, "details", (100, 160))
+            ], 0),
             
             # Phase 3: 512x512 - Details
             (512, [
-                (150, (10, 15), 90, "fine_details", (90, 150)),
+                (100, (10, 18), 80, "details", (90, 150)),
                 (200, (8, 10), 90, "fine_details 2 ", (80, 140)),
                 (200, (3, 5), 90, "refinement", (70, 130)),
                 (200, (1, 3), 90, "refinement 2 ", (50, 130)),
-                (200, (1, 3), 90, "refinement 3 ", (50, 130)),
-                (200, (0.5, 1), 80, "refinement 4 ", (50, 120))
+                (200, (1, 3), 100, "refinement 3 ", (50, 130)),
+                (200, (0.5, 1), 100, "refinement 4 ", (50, 120)),
+                (200, (0.5, 1), 150, "refinement 4 ", (50, 120))
                 
-            ], 50),
-            (512, [
-                (200, (1, 3), 90, "refinement 3 ", (50, 130)),
-                (200, (0.5, 1), 80, "refinement 4 ", (50, 120))
-            ], 50)
+            ], 0)
         ]
         
         self.accumulated_strokes = []
+        self.stroke_resolutions = []
         self.patience = 15
         
     def _preload_brushes(self):
@@ -123,17 +118,27 @@ class BrushStrokeEA:
         # Precompute histograms
         self.target_hist = [cv2.calcHist([self.target], [i], None, [256], [0, 256]) for i in range(3)]
     
-    def upscale_strokes(self, scale_factor: float):
-        """Upscale all accumulated strokes by scale factor"""
+    def upscale_strokes(self, target_resolution: int):
+        """Upscale all accumulated strokes to target resolution"""
         self.canvas_cache = None
         self.canvas_cache_cv = None
+        
         for i in range(len(self.accumulated_strokes)):
             layer = self.accumulated_strokes[i].copy()
+            original_resolution = self.stroke_resolutions[i]
+            
+            # Масштабируем относительно ОРИГИНАЛЬНОГО разрешения слоя
+            scale_factor = target_resolution / original_resolution 
+            
+            
+            print(f"  Layer {i+1}: {original_resolution}x{original_resolution} -> {target_resolution}x{target_resolution} (scale: {scale_factor:.2f}x)")
+            
             layer[:, 0] *= scale_factor  # x
             layer[:, 1] *= scale_factor  # y
             layer[:, 5] *= scale_factor  # size
-            # Keep color, rotation, alpha the same
+            
             self.accumulated_strokes[i] = layer
+            self.stroke_resolutions[i] = target_resolution
     
     def sample_color_from_region(self, x: int, y: int, radius: int = 10) -> Tuple[int, int, int]:
         """Sample average color from region"""
@@ -407,6 +412,7 @@ class BrushStrokeEA:
     
         # Обновить кеш после добавления layer
         self.accumulated_strokes.append(best_layer)
+        self.stroke_resolutions.append(self.current_resolution)
         rendered = self.render_strokes(self.accumulated_strokes, use_cache=False)
         self.canvas_cache = Image.fromarray(cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB))
         self.canvas_cache_cv = rendered
@@ -466,6 +472,7 @@ class BrushStrokeEA:
             
             if new_strokes:
                 self.accumulated_strokes.append(np.array(new_strokes))
+                self.stroke_resolutions.append(self.current_resolution)
             
             if iteration % 10 == 0:
                 current_fitness = self.fitness(np.zeros((1, 8)))  # Dummy, just to get fitness
@@ -478,7 +485,7 @@ class BrushStrokeEA:
     def run(self, run_number: int):
         """Run multi-resolution EA with greedy refinement"""
 
-        self.run_folder = f"run_{7}"
+        self.run_folder = f"run_{run}"
         os.makedirs(self.run_folder, exist_ok=True)
 
         print(f"\n{'='*80}")
@@ -487,6 +494,7 @@ class BrushStrokeEA:
         
         start_time = time.time()
         self.accumulated_strokes = []
+        self.stroke_resolutions = []
         
         all_avg_histories = []
         all_max_histories = []
@@ -502,10 +510,8 @@ class BrushStrokeEA:
             
             # Upscale strokes from previous phase
             if phase_num > 1:
-                prev_resolution = self.phases[phase_num - 2][0]
-                scale_factor = resolution / prev_resolution
-                print(f"Upscaling strokes by {scale_factor}x")
-                self.upscale_strokes(scale_factor)
+                print(f"Upscaling all strokes to {resolution}x{resolution}")
+                self.upscale_strokes(resolution)
             
 
             if len(self.accumulated_strokes) > 0:
@@ -578,7 +584,7 @@ if __name__ == "__main__":
     NUM_RUNS = 1
     
     for run in range(1, NUM_RUNS + 1):
-        ea = BrushStrokeEA(f"{INPUT}{7}.jpg", BRUSH_STROKE, OUTPUT_PREFIX)
+        ea = BrushStrokeEA(f"{INPUT}{run}.jpg", BRUSH_STROKE, OUTPUT_PREFIX)
         elapsed, avg_histories, max_histories = ea.run(run)
         
         print(f"\n{'='*80}")
