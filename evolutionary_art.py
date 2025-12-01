@@ -82,6 +82,10 @@ class BrushStrokeEA:
                 (200, (1, 3), 90, "refinement 3 ", (50, 130)),
                 (200, (0.5, 1), 80, "refinement 4 ", (50, 120))
                 
+            ], 50),
+            (512, [
+                (200, (1, 3), 90, "refinement 3 ", (50, 130)),
+                (200, (0.5, 1), 80, "refinement 4 ", (50, 120))
             ], 50)
         ]
         
@@ -226,7 +230,8 @@ class BrushStrokeEA:
         
         if use_cache and self.canvas_cache is not None:
             canvas = self.canvas_cache.copy()
-            strokes_to_render = [strokes_list[-1]]
+            cached_layers_count = len(self.accumulated_strokes)
+            strokes_to_render = strokes_list[cached_layers_count:]
         else:
             canvas = Image.new('RGB', (res, res), (255, 255, 255))
             strokes_to_render = strokes_list
@@ -235,9 +240,13 @@ class BrushStrokeEA:
             for stroke in strokes:
                 x, y, r, g, b, size, rotation, alpha = stroke
                 
-                # Clip координаты вместо skip
-                x = np.clip(x, 0, res - 1)
-                y = np.clip(y, 0, res - 1)
+                # ВАЖНО: проверяем что координаты в пределах текущего разрешения
+                if x < 0 or x >= res or y < 0 or y >= res:
+                    print(f"WARNING: Stroke outside bounds: ({x}, {y}) for res {res}")
+                    continue
+                
+                x = int(np.clip(x, 0, res - 1))
+                y = int(np.clip(y, 0, res - 1))
                 
                 brush = self._get_brush(int(size))
                 brush = brush.rotate(rotation, expand=True, resample=Image.BILINEAR)
@@ -250,8 +259,8 @@ class BrushStrokeEA:
                 
                 try:
                     canvas.paste(colored, (paste_x, paste_y), colored)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Error pasting stroke at ({x}, {y}): {e}")
         
         return cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
     
@@ -469,7 +478,7 @@ class BrushStrokeEA:
     def run(self, run_number: int):
         """Run multi-resolution EA with greedy refinement"""
 
-        self.run_folder = f"run_{run_number}"
+        self.run_folder = f"run_{7}"
         os.makedirs(self.run_folder, exist_ok=True)
 
         print(f"\n{'='*80}")
@@ -487,6 +496,9 @@ class BrushStrokeEA:
             print(f"\n{'='*80}")
             print(f"PHASE {phase_num}: Resolution {resolution}x{resolution}")
             print(f"{'='*80}")
+
+            # Set current resolution
+            self.set_resolution(resolution)
             
             # Upscale strokes from previous phase
             if phase_num > 1:
@@ -495,8 +507,6 @@ class BrushStrokeEA:
                 print(f"Upscaling strokes by {scale_factor}x")
                 self.upscale_strokes(scale_factor)
             
-            # Set current resolution
-            self.set_resolution(resolution)
 
             if len(self.accumulated_strokes) > 0:
                 rendered = self.render_strokes(self.accumulated_strokes, use_cache=False)
@@ -531,12 +541,15 @@ class BrushStrokeEA:
         print(f"\n{'='*80}")
         print(f"Total time: {elapsed_time/60:.2f} minutes")
         print(f"{'='*80}")
-        
+
+        print(f"\nGenerating final results at resolution {self.current_resolution}")
+        print(f"Total accumulated layers: {len(self.accumulated_strokes)}")
+
         # Generate final variations
         final_results = []
         
         # Best result
-        final_results.append(self.render_strokes(self.accumulated_strokes))
+        final_results.append(self.render_strokes(self.accumulated_strokes, use_cache=False))
         
         # 4 slight variations
         for i in range(4):
@@ -562,10 +575,10 @@ if __name__ == "__main__":
     INPUT = "input"
     BRUSH_STROKE = "brush.png"
     OUTPUT_PREFIX = "NameSurname"
-    NUM_RUNS = 5
+    NUM_RUNS = 1
     
     for run in range(1, NUM_RUNS + 1):
-        ea = BrushStrokeEA(f"{INPUT}{run}.jpg", BRUSH_STROKE, OUTPUT_PREFIX)
+        ea = BrushStrokeEA(f"{INPUT}{7}.jpg", BRUSH_STROKE, OUTPUT_PREFIX)
         elapsed, avg_histories, max_histories = ea.run(run)
         
         print(f"\n{'='*80}")
