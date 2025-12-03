@@ -12,15 +12,15 @@
   <hr>
 
   <a href="input3.jpg" target="_blank">
-    <img src="input3.jpg" alt="Исходное изображение" width="300px" style="display: inline-block; margin: 0 5px; border-radius: 5px; border: 1px solid #ddd;">
+    <img src="input3.jpg" alt="Исходное изображение" width="30%" style="display: inline-block; margin: 0 5px; border-radius: 5px; border: 1px solid #ddd;">
   </a>
     
   <a href="run_example/NameSurnameAnimation3_1.gif" target="_blank">
-    <img src="run_example/NameSurnameAnimation3_1.gif" alt="Процесс генерации GIF" width="300px" style="display: inline-block; margin: 0 5px; border-radius: 5px; border: 1px solid #ddd;">
+    <img src="run_example/NameSurnameAnimation3_1.gif" alt="Процесс генерации GIF" width="30%" style="display: inline-block; margin: 0 5px; border-radius: 5px; border: 1px solid #ddd;">
   </a>
 
   <a href="run_example/temp_phase3.jpg" target="_blank">
-    <img src="run_example/temp_phase3.jpg" alt="Финальный результат" width="300px" style="display: inline-block; margin: 0 5px; border-radius: 5px; border: 1px solid #ddd;">
+    <img src="run_example/temp_phase3.jpg" alt="Финальный результат" width="30%" style="display: inline-block; margin: 0 5px; border-radius: 5px; border: 1px solid #ddd;">
   </a>
 
   ---
