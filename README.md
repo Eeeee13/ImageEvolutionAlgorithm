@@ -8,7 +8,7 @@
 ---
 <p align="center">
   
-  <h3 align="center">До, Во время и После: Результат Эволюционного Алгоритма</h3>
+  <h3 align="center">Работа Эволюционного Алгоритма</h3>
   <hr>
 
   <a href="input3.jpg" target="_blank">
