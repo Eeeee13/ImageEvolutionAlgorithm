@@ -6,6 +6,24 @@
 Проект демонстрирует применение методов **Биоинспирированных вычислений** и **Компьютерного зрения** для решения задач генеративного дизайна.
 
 ---
+<p align="center">
+  
+  <h3 align="center">До, Во время и После: Результат Эволюционного Алгоритма</h3>
+  <hr>
+
+  <a href="" target="_blank">
+    <img src="input3.jpg" alt="Исходное изображение" width="300px" style="display: inline-block; margin: 0 5px; border-radius: 5px; border: 1px solid #ddd;">
+  </a>
+    
+  <a href="run_example/NameSurnameAnimation3_1.gif" target="_blank">
+    <img src="ПУТЬ_К_ВАШЕМУ_GIF_АНИМАЦИИ.gif" alt="Процесс генерации GIF" width="300px" style="display: inline-block; margin: 0 5px; border-radius: 5px; border: 1px solid #ddd;">
+  </a>
+
+  <a href="ПУТЬ_К_ПОЛНОРАЗМЕРНОМУ_ИЗОБРАЖЕНИЮ_ПОСЛЕ" target="_blank">
+    <img src="run_example/temp_phase3.jpg" alt="Финальный результат" width="300px" style="display: inline-block; margin: 0 5px; border-radius: 5px; border: 1px solid #ddd;">
+  </a>
+
+  ---
 
 ### **🧠 Техническая реализация и архитектура**
 
